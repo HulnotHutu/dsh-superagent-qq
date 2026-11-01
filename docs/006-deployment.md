@@ -25,6 +25,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 - A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
+- For QQ (optional): `napq`, shipped in this repository under `napq/` (Python 3.9+, no dependencies), talking to a OneBot v11 HTTP endpoint such as [NapCat](https://napneko.github.io/). The QQ Source walkthrough in the README describes how the Source uses it.
 
 ## Accounts
 
@@ -67,6 +68,26 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
    The host refuses a CLI that can act as a user. It reads the app id, Feishu/Lark brand and bot `open_id` from the bot configuration.
 
    Both configurations share the keychain entry for the app secret. To remove only the bot configuration, delete its directory; do not run `lark-cli config remove`, which would affect the shared secret.
+
+### QQ bot (optional)
+
+1. Run a OneBot v11 client implementation with an HTTP server, such as NapCat, signed in as the bot's QQ account. Note its HTTP endpoint (host and port) and its access token.
+2. Install `napq` from this repository and configure it:
+
+   ```sh
+   install -m 0755 napq/napq ~/.local/bin/napq
+   mkdir -p ~/.config/napq
+   cat > ~/.config/napq/config.json <<'EOF'
+   { "baseUrl": "<host:port>", "accessToken": "<token>" }
+   EOF
+   chmod 600 ~/.config/napq/config.json
+   ```
+
+   `napq` keeps the token in this file only and never prints it; reply idempotency keys live in `~/.config/napq/replied.json`, so a retried reply never posts twice.
+3. Unlike `gh` and `lark-cli`, QQ has no per-source CLI setting or setup probe: the plugin runs `napq` from the service PATH. If the service runs under a different user or a restricted PATH, put a `napq` shim in the state directory's `worker-bin` directory. A missing or misconfigured `napq` surfaces only after three failed poll rounds, as the `qq` health entry.
+4. In the panel, enable the QQ Source, add the bot's groups (each with "仅 @" or "全部消息"), and list the QQ numbers allowed to originate work under **Eval → On each Source**. A group seen for the first time starts from "now": its backlog is history, not requests.
+
+Connecting to QQ through a third-party OneBot v11 implementation may violate Tencent's terms of service; see the disclaimer in the README.
 
 ## Install
 

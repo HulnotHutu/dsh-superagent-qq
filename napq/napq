@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+# MIT License. Copyright (c) 2026 DeepSeek Harness Team. See the repository LICENSE.
+# napq — a standalone QQ (OneBot v11) HTTP-to-CLI translator for the dsh-superagent qq Source.
+"""napq — QQ (OneBot v11) CLI for the dsh-superagent qq Source.
+
+Speaks the Source's CLI contract through the local OneBot HTTP API:
+  napq pull   --groups <id,id>  --after '<json map>' --json
+  napq reply  --conversation <group> --to <message_id> --key <key> --text <text>
+  napq thread --conversation <group> --root <message_id> --json
+
+Configuration lives in ~/.config/napq/config.json ({"baseUrl", "accessToken"}); the token is
+never printed. Reply idempotency keys are kept in ~/.config/napq/replied.json.
+"""
+import argparse
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HOME = pathlib.Path.home()
+CONFIG = HOME / '.config/napq/config.json'
+REPLIED = HOME / '.config/napq/replied.json'
+HISTORY_COUNT = 50
+
+
+def load_config():
+    if not CONFIG.exists():
+        fail('napq is not configured: create ' + str(CONFIG), 500)
+    cfg = json.loads(CONFIG.read_text())
+    base = str(cfg.get('baseUrl') or '').rstrip('/')
+    token = str(cfg.get('accessToken') or '')
+    if not base or not token:
+        fail('napq configuration needs both baseUrl and accessToken', 500)
+    return base, token
+
+
+def fail(message, code, exit_code=1):
+    sys.stderr.write(json.dumps({'error': {'code': code, 'message': message}}, ensure_ascii=False) + '\n')
+    sys.exit(exit_code)
+
+
+def api(base, token, action, params):
+    """POST one OneBot action and return its JSON answer; HTTP-level failures become napq errors."""
+    req = urllib.request.Request(base + '/' + action, data=json.dumps(params or {}).encode(), method='POST',
+                                 headers={'content-type': 'application/json', 'Authorization': 'Bearer ' + token})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode('utf-8', 'replace')
+        fail(f'{action} HTTP {error.code}: {body[:200]}', 500)
+    except (urllib.error.URLError, OSError) as error:
+        fail(f'{action} unreachable: {error}', 500)
+
+
+def check(answer, action):
+    if answer.get('status') != 'ok':
+        fail(f'{action}: {answer.get("wording") or answer}', 500)
+    return answer.get('data') or {}
+
+
+def segments(message):
+    return [(item.get('type'), item.get('data') or {}) for item in message or [] if isinstance(item, dict)]
+
+
+def text_of(message):
+    parts = []
+    for kind, data in segments(message.get('message')):
+        if kind == 'text':
+            parts.append(str(data.get('text', '')))
+        elif kind == 'at':
+            parts.append('@' + str(data.get('qq', '')))
+        elif kind == 'image':
+            parts.append('[图片]')
+        elif kind == 'face':
+            parts.append('[表情]')
+        elif kind == 'reply':
+            continue
+        else:
+            parts.append(f'[{kind}]')
+    return ''.join(parts).strip()
+
+
+def mentions_me(message, me):
+    return any(kind == 'at' and str(data.get('qq', '')) == me for kind, data in segments(message.get('message')))
+
+
+def reply_to(message):
+    for kind, data in segments(message.get('message')):
+        if kind == 'reply':
+            return str(data.get('id', ''))
+    return None
+
+
+def item(message, me):
+    group = message.get('group_id')
+    reply = reply_to(message)
+    return {
+        'id': str(message.get('message_id')),
+        'conversation': str(group),
+        'thread': str(group),
+        'sender': {'id': str(message.get('user_id')), 'bot': False},
+        'mentions_me': mentions_me(message, me),
+        'text': text_of(message),
+        'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(int(message.get('time') or 0))),
+        'seq': int(message.get('message_seq') or 0),
+        **({'reply_to': reply} if reply else {}),
+    }
+
+
+def cmd_pull(args):
+    base, token = load_config()
+    me = str(check(api(base, token, 'get_login_info', {}), 'get_login_info').get('user_id', ''))
+    if not me:
+        fail('napq cannot read the bot account', 500)
+    try:
+        after = json.loads(args.after) if args.after else {}
+    except json.JSONDecodeError:
+        fail('--after must be a JSON object such as {"2000000002": 1}', 500)
+    items, following = [], {}
+    for group in [entry.strip() for entry in (args.groups or '').split(',') if entry.strip()]:
+        try:
+            answer = api(base, token, 'get_group_msg_history', {'group_id': int(group), 'count': HISTORY_COUNT})
+            messages = check(answer, 'get_group_msg_history').get('messages') or []
+        except SystemExit:
+            # A group the bot left (or was never in) yields no messages and keeps its cursor.
+            messages = []
+        high = int(after.get(group, 0))
+        for message in messages:
+            if str(message.get('user_id')) == me:
+                continue
+            items.append(item(message, me))
+        seqs = [int(message.get('message_seq') or 0) for message in messages]
+        following[group] = max(seqs + [high]) if seqs else high
+    print(json.dumps({'me': me, 'items': items, 'next': following}, ensure_ascii=False))
+
+
+def cmd_reply(args):
+    base, token = load_config()
+    replied = json.loads(REPLIED.read_text()) if REPLIED.exists() else {}
+    if args.key in replied:
+        print('ok')
+        return
+    answer = api(base, token, 'send_group_msg', {'group_id': int(args.conversation),
+                                                 'message': [{'type': 'reply', 'data': {'id': str(args.to)}},
+                                                             {'type': 'text', 'data': {'text': args.text}}]})
+    data = check(answer, 'send_group_msg')
+    if not data.get('message_id'):
+        fail(f'send_group_msg returned no message id: {answer}', 500)
+    replied[args.key] = int(time.time())
+    # Keep the idempotency record small; the oldest keys are dropped.
+    if len(replied) > 2000:
+        replied = dict(sorted(replied.items(), key=lambda pair: pair[1])[-2000:])
+    REPLIED.write_text(json.dumps(replied))
+    os.chmod(REPLIED, 0o600)
+    print('ok')
+
+
+def cmd_thread(args):
+    base, token = load_config()
+    me = str(check(api(base, token, 'get_login_info', {}), 'get_login_info').get('user_id', ''))
+    params = {'group_id': int(args.conversation), 'count': 20}
+    if args.root:
+        params['message_id'] = int(args.root)
+    try:
+        messages = check(api(base, token, 'get_group_msg_history', params), 'get_group_msg_history').get('messages') or []
+    except SystemExit:
+        messages = []
+    print(json.dumps({'items': [item(message, me) for message in messages]}, ensure_ascii=False))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='napq')
+    sub = parser.add_subparsers(dest='command', required=True)
+    pull = sub.add_parser('pull')
+    pull.add_argument('--groups', required=True)
+    pull.add_argument('--after', default='')
+    pull.add_argument('--json', action='store_true')
+    reply = sub.add_parser('reply')
+    reply.add_argument('--conversation', required=True)
+    reply.add_argument('--to', required=True)
+    reply.add_argument('--key', required=True)
+    reply.add_argument('--text', required=True)
+    thread = sub.add_parser('thread')
+    thread.add_argument('--conversation', required=True)
+    thread.add_argument('--root', default='')
+    thread.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    {'pull': cmd_pull, 'reply': cmd_reply, 'thread': cmd_thread}[args.command](args)
+
+
+if __name__ == '__main__':
+    main()
