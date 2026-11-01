@@ -11,6 +11,8 @@ import { CliError } from '../src/infra/commands.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
+// These specs assert on git's own stderr, so keep spawned git output in English under any system locale.
+process.env.LC_ALL = 'C'
 // Git and shell subprocesses can exceed the 5s default timeout when the test suite runs in parallel.
 vi.setConfig({ testTimeout: 30_000 })
 const exec = promisify(execFile)
